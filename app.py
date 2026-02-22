@@ -1,7 +1,8 @@
 # app.py
 import os
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Security
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
 from openai import OpenAI
 
@@ -10,11 +11,32 @@ load_dotenv()
 app = FastAPI(title="ISDM RAG API", version="0.3.0")
 
 # -------------------------
+# SEGURIDAD API KEY
+# -------------------------
+
+API_KEY = os.getenv("ISDM_API_KEY")
+API_KEY_NAME = "X-API-KEY"
+
+api_key_header = APIKeyHeader(
+    name=API_KEY_NAME,
+    auto_error=False
+)
+
+def require_api_key(api_key: str = Security(api_key_header)):
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="ISDM_API_KEY not configured")
+
+    if not api_key or api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    return api_key
+
+
+# -------------------------
 # CONFIG / CLIENT
 # -------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    # Mejor fallar con mensaje claro que con KeyError
     raise RuntimeError("Missing env var: OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -34,11 +56,12 @@ def get_vector_store_id() -> str:
 VECTOR_STORE_ID = get_vector_store_id()
 
 # -------------------------
-# BASIC ENDPOINTS
+# BASIC ENDPOINTS (PÚBLICOS)
 # -------------------------
 @app.get("/")
 def root():
     return {"ok": True, "service": "ISDM_RAG", "version": app.version}
+
 
 @app.get("/health")
 def health():
@@ -69,32 +92,22 @@ class SearchResponse(BaseModel):
 
 
 class ImproveRequest(BaseModel):
-    # qué querés lograr
     objetivo: str = Field(..., min_length=5)
-
-    # consulta para recuperar contexto (si modo_fuentes != "none")
     query: str = Field(..., min_length=2)
-
-    # filtros
     anio: str | None = None
     materia: str | None = None
     unidad: str | None = None
     k: int = Field(10, ge=3, le=20)
 
-    # comportamiento respecto a fuentes
-    # - required: si no hay fuentes, NO inventa (devuelve mensaje pidiendo material)
-    # - optional: usa fuentes si hay; si no, propone igual pero avisa que es general
-    # - none: no busca; propone directamente (modo remoto)
     modo_fuentes: str = Field(
         "optional",
         pattern="^(required|optional|none)$"
     )
 
-    # parámetros docentes
     nivel: str = "Superior ISDM"
-    formato_salida: str = "plan_clase"  # plan_clase | cronograma | guia_practica | rubrica | mejoras_documento
+    formato_salida: str = "plan_clase"
     tono: str = "profesional_cercano"
-    restricciones: str | None = None  # ej: "sin PP1", "solo cuatrimestre 1", etc.
+    restricciones: str | None = None
 
 
 class ImproveResponse(BaseModel):
@@ -103,10 +116,10 @@ class ImproveResponse(BaseModel):
 
 
 # -------------------------
-# SEARCH
+# SEARCH (PROTEGIDO)
 # -------------------------
 @app.post("/search", response_model=SearchResponse)
-def search(req: SearchRequest):
+def search(req: SearchRequest, _: str = Depends(require_api_key)):
     filters = {}
     if req.anio:
         filters["anio"] = req.anio
@@ -144,14 +157,13 @@ def search(req: SearchRequest):
 
 
 # -------------------------
-# IMPROVE FOR 2026
+# IMPROVE FOR 2026 (PROTEGIDO)
 # -------------------------
 @app.post("/improve_2026", response_model=ImproveResponse)
-def improve_2026(req: ImproveRequest):
+def improve_2026(req: ImproveRequest, _: str = Depends(require_api_key)):
     sources: list[dict] = []
     context = ""
 
-    # 1) Buscar material relevante (según modo)
     if req.modo_fuentes != "none":
         sreq = SearchRequest(
             query=req.query,
@@ -160,7 +172,7 @@ def improve_2026(req: ImproveRequest):
             materia=req.materia,
             unidad=req.unidad
         )
-        sresp: SearchResponse = search(sreq)
+        sresp: SearchResponse = search(sreq, API_KEY)
 
         context_blocks = []
         for i, r in enumerate(sresp.results, start=1):
@@ -184,71 +196,31 @@ def improve_2026(req: ImproveRequest):
 
         context = "\n\n".join(context_blocks)
 
-        # si exige fuentes y no hay
         if req.modo_fuentes == "required" and len(sresp.results) == 0:
             return ImproveResponse(
                 used_sources=[],
-                output=(
-                    "No encontré fuentes ISDM en el Vector Store con esos filtros.\n"
-                    "✅ Podés:\n"
-                    "- aflojar filtros (anio/materia/unidad)\n"
-                    "- cambiar la query\n"
-                    "- o reindexar material 2025 relacionado\n"
-                    "Si querés igualmente una propuesta general, pedime 'modo remoto' o usa modo_fuentes='optional'/'none'."
-                )
+                output="No encontré fuentes ISDM con esos filtros."
             )
 
-    # 2) Instrucciones según haya contexto o no
     if context.strip():
         rule = (
-            "REGLA: basate únicamente en el CONTEXTO provisto (fragmentos recuperados) "
-            "y citá/respaldá con lo recuperado. Si falta info, decilo y pedí qué documento haría falta."
+            "REGLA: basate únicamente en el CONTEXTO provisto "
+            "y citá lo recuperado."
         )
-        context_header = "CONTEXTO (material 2025 recuperado):"
         context_body = context
     else:
-        # modo remoto o no encontró fuentes
         rule = (
-            "REGLA: NO hay contexto ISDM provisto. Generá una propuesta general y práctica, "
-            "pero ACLARÁ explícitamente que no se encontraron fuentes ISDM para respaldarla."
+            "REGLA: NO hay contexto ISDM. Generá propuesta general "
+            "y aclaralo explícitamente."
         )
-        context_header = "CONTEXTO:"
-        context_body = "[SIN CONTEXTO ISDM RECUPERADO]"
-
-    system_instructions = f"""
-Sos un asistente pedagógico-profesional para nivel {req.nivel}.
-{rule}
-
-Objetivo del usuario: {req.objetivo}
-Formato de salida: {req.formato_salida}
-Tono: {req.tono}
-Restricciones: {req.restricciones or "ninguna"}
-
-Entregá propuestas concretas, mejoradas, reutilizables para 2026.
-Incluí: mejoras, reestructuración, y un borrador listo para copiar/pegar.
-"""
-
-    user_prompt = f"""
-MODO_FUENTES: {req.modo_fuentes}
-CANTIDAD_FUENTES: {len(sources)}
-
-{context_header}
-{context_body}
-
-TAREA:
-1) Detectá problemas/mejoras (claridad, secuenciación, evaluación, actividades, tiempos).
-2) Proponé una versión 2026 mejorada.
-3) Si el formato_salida es plan_clase: incluir objetivos, inicio-desarrollo-cierre, actividad práctica, evidencias, evaluación/rúbrica breve, materiales.
-4) Si cronograma: tabla por clase/semana con entregables.
-5) Si guia_practica: consigna + pasos + criterios de logro + checklist.
-"""
+        context_body = "[SIN CONTEXTO ISDM]"
 
     try:
         resp = client.responses.create(
             model="gpt-4.1-mini",
             input=[
-                {"role": "system", "content": system_instructions},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": rule},
+                {"role": "user", "content": context_body},
             ],
         )
     except Exception as e:
