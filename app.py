@@ -77,6 +77,8 @@ class SearchRequest(BaseModel):
     anio: str | None = None
     materia: str | None = None
     unidad: str | None = None
+    unidad_num: str | None = None
+    tipo: str | None = None
 
 
 class SearchResult(BaseModel):
@@ -98,6 +100,8 @@ class ImproveRequest(BaseModel):
     materia: str | None = None
     unidad: str | None = None
     k: int = Field(10, ge=3, le=20)
+    unidad_num: str | None = None
+    tipo: str | None = None
 
     modo_fuentes: str = Field(
         "optional",
@@ -120,20 +124,66 @@ class ImproveResponse(BaseModel):
 # -------------------------
 @app.post("/search", response_model=SearchResponse)
 def search(req: SearchRequest, _: str = Depends(require_api_key)):
-    filters = {}
+    filter_clauses = []
+
     if req.anio:
-        filters["anio"] = req.anio
+        filter_clauses.append({
+            "type": "eq",
+            "key": "anio",
+            "value": req.anio
+        })
+
     if req.materia:
-        filters["materia"] = req.materia
+        filter_clauses.append({
+            "type": "eq",
+            "key": "materia",
+            "value": req.materia
+        })
+
     if req.unidad:
-        filters["unidad"] = req.unidad
+        filter_clauses.append({
+            "type": "eq",
+            "key": "unidad",
+            "value": req.unidad
+        })
+
+    if req.unidad_num:
+        filter_clauses.append({
+            "type": "eq",
+            "key": "unidad_num",
+            "value": req.unidad_num
+        })
+
+    if req.tipo:
+        filter_clauses.append({
+            "type": "eq",
+            "key": "tipo",
+            "value": req.tipo
+        })
+
+    filters = None
+    if len(filter_clauses) == 1:
+        filters = filter_clauses[0]
+    elif len(filter_clauses) > 1:
+        filters = {
+            "type": "and",
+            "filters": filter_clauses
+        }      
+
+    # Permitir filtrar por número de unidad (si existe en metadata)
+    if hasattr(req, "unidad_num") and getattr(req, "unidad_num"):
+        filters["unidad_num"] = req.unidad_num
+
+    # Permitir filtrar por tipo (programa / unidad / otros)
+    if hasattr(req, "tipo") and getattr(req, "tipo"):
+        filters["tipo"] = req.tipo
 
     try:
         resp = client.vector_stores.search(
             vector_store_id=VECTOR_STORE_ID,
             query=req.query,
             max_num_results=req.k,
-            filters=filters if filters else None
+            filters=filters
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Vector store search failed: {e}")
