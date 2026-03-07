@@ -168,15 +168,7 @@ def search(req: SearchRequest, _: str = Depends(require_api_key)):
         filters = {
             "type": "and",
             "filters": filter_clauses
-        }      
-
-    # Permitir filtrar por número de unidad (si existe en metadata)
-    if hasattr(req, "unidad_num") and getattr(req, "unidad_num"):
-        filters["unidad_num"] = req.unidad_num
-
-    # Permitir filtrar por tipo (programa / unidad / otros)
-    if hasattr(req, "tipo") and getattr(req, "tipo"):
-        filters["tipo"] = req.tipo
+        }
 
     try:
         resp = client.vector_stores.search(
@@ -194,7 +186,7 @@ def search(req: SearchRequest, _: str = Depends(require_api_key)):
         if isinstance(content, list) and content:
             txt = "\n".join([c.get("text", "") for c in content if isinstance(c, dict)])
         else:
-            txt = str(content)
+            txt = str(content) if content else ""
 
         out.append(SearchResult(
             text=txt,
