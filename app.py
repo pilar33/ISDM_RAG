@@ -182,11 +182,33 @@ def search(req: SearchRequest, _: str = Depends(require_api_key)):
 
     out = []
     for item in resp.data:
-        content = item.content
-        if isinstance(content, list) and content:
-            txt = "\n".join([c.get("text", "") for c in content if isinstance(c, dict)])
-        else:
-            txt = str(content) if content else ""
+        txt = ""
+
+        content = getattr(item, "content", None)
+
+        if isinstance(content, list):
+            parts = []
+            for c in content:
+                if isinstance(c, dict):
+                    if "text" in c and c["text"]:
+                        parts.append(str(c["text"]))
+                    elif "content" in c and c["content"]:
+                        parts.append(str(c["content"]))
+                else:
+                    c_text = getattr(c, "text", None)
+                    if c_text:
+                        parts.append(str(c_text))
+                    else:
+                        c_content = getattr(c, "content", None)
+                        if c_content:
+                            parts.append(str(c_content))
+            txt = "\n".join(parts).strip()
+
+        elif isinstance(content, dict):
+            txt = str(content.get("text") or content.get("content") or "").strip()
+
+        elif content is not None:
+            txt = str(content).strip()
 
         out.append(SearchResult(
             text=txt,
