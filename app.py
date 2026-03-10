@@ -1,6 +1,7 @@
-# app.py
 import os
 import re
+import logging
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional
 
@@ -12,7 +13,21 @@ from openai import OpenAI
 
 load_dotenv()
 
-app = FastAPI(title="ISDM RAG API", version="0.5.0")
+# -------------------------
+# LOGGING
+# -------------------------
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+logger = logging.getLogger("isdm_rag_api")
+
+# -------------------------
+# APP
+# -------------------------
+
+app = FastAPI(title="ISDM RAG API", version="0.6.0")
 
 # -------------------------
 # SEGURIDAD API KEY
@@ -52,9 +67,11 @@ VECTOR_STORE_NAME = os.environ.get("VECTOR_STORE_NAME", "ISDM_2025_C1")
 OUTPUT_ROOT_DIR = Path(
     os.environ.get(
         "OUTPUT_ROOT_DIR",
-        r"C:\xampp\htdocs\ProfePilar\data\ISDM\2026\ISDM"
+        "./generated_docs"
     )
 )
+
+MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 
 
 def get_vector_store_id() -> str:
@@ -69,7 +86,7 @@ def get_vector_store_id() -> str:
 VECTOR_STORE_ID = get_vector_store_id()
 
 # -------------------------
-# BASIC ENDPOINTS
+# BASIC ENDPOINTS (PÚBLICOS)
 # -------------------------
 
 
@@ -79,6 +96,8 @@ def root():
         "ok": True,
         "service": "ISDM_RAG",
         "version": app.version,
+        "vector_store_name": VECTOR_STORE_NAME,
+        "vector_store_id": VECTOR_STORE_ID,
         "output_root_dir": str(OUTPUT_ROOT_DIR),
     }
 
@@ -121,7 +140,7 @@ class ImproveRequest(BaseModel):
     anio: Optional[str] = None
     materia: Optional[str] = None
     unidad: Optional[str] = None
-    k: int = Field(10, ge=1, le=20)
+    k: int = Field(10, ge=3, le=20)
     unidad_num: Optional[str] = None
     tipo: Optional[str] = None
 
@@ -135,6 +154,10 @@ class ImproveRequest(BaseModel):
     tono: str = "profesional_cercano"
     restricciones: Optional[str] = None
 
+    # nuevos campos opcionales, no rompen compatibilidad
+    cantidad_documentos: int = Field(1, ge=1, le=20)
+    output_subdir: Optional[str] = None
+
 
 class ImproveResponse(BaseModel):
     used_sources: list[dict]
@@ -146,7 +169,7 @@ class ImproveResponse(BaseModel):
 # -------------------------
 
 
-def sanitize_filename(value: Optional[str], fallback: str = "Documento") -> str:
+def sanitize_filename(value: Optional[str], fallback: str) -> str:
     text = (value or "").strip()
     if not text:
         text = fallback
@@ -202,7 +225,6 @@ def normalize_materia_folder(materia: Optional[str]) -> str:
 def detect_file_prefix(req: ImproveRequest) -> str:
     text = f"{req.query} {req.objetivo} {req.formato_salida} {req.tipo or ''}".lower()
 
-    # clases por número
     patterns = [
         (r"\bprimera clase\b|\bclase 1\b|\bclase uno\b", "Clase_1"),
         (r"\bsegunda clase\b|\bclase 2\b|\bclase dos\b", "Clase_2"),
@@ -236,11 +258,9 @@ def detect_file_prefix(req: ImproveRequest) -> str:
 
 
 def detect_subfolder(req: ImproveRequest) -> Optional[str]:
-    """
-    Mantiene la lógica libre y flexible que ya venías usando:
-    si el pedido menciona diagnóstico, crea subcarpeta.
-    Si no, guarda directo en la carpeta de la materia.
-    """
+    if req.output_subdir:
+        return sanitize_filename(req.output_subdir, "subdir")
+
     text = f"{req.query} {req.objetivo} {req.unidad or ''} {req.tipo or ''}".lower()
 
     if "diagnostico" in text or "diagnóstico" in text:
@@ -249,6 +269,90 @@ def detect_subfolder(req: ImproveRequest) -> Optional[str]:
         return "diagnostico"
 
     return None
+
+
+def extract_explicit_class_numbers(text: str) -> list[int]:
+    found = set()
+
+    numeric = re.findall(r"\bclases?\s*(\d+)\s*(?:,|y|-|a)?\s*(\d+)?\b", text.lower())
+    for a, b in numeric:
+        if a:
+            found.add(int(a))
+        if b:
+            found.add(int(b))
+
+    standalone = re.findall(r"\bclase\s*(\d+)\b", text.lower())
+    for n in standalone:
+        found.add(int(n))
+
+    word_map = {
+        "primera": 1, "segunda": 2, "tercera": 3, "cuarta": 4, "quinta": 5,
+        "sexta": 6, "septima": 7, "séptima": 7, "octava": 8, "novena": 9, "decima": 10, "décima": 10,
+    }
+
+    for word, num in word_map.items():
+        if re.search(rf"\b{word}\b", text.lower()):
+            found.add(num)
+
+    return sorted(n for n in found if 1 <= n <= 50)
+
+
+def infer_multi_class_requests(req: ImproveRequest) -> list[ImproveRequest]:
+    """
+    Mantiene compatibilidad:
+    - si no detecta multi-documento => devuelve [req]
+    - si detecta varias clases => devuelve N requests derivados
+    """
+    if req.cantidad_documentos > 1:
+        generated = []
+        class_nums = extract_explicit_class_numbers(f"{req.query} {req.objetivo}")
+
+        if not class_nums:
+            class_nums = list(range(1, req.cantidad_documentos + 1))
+
+        for n in class_nums[:req.cantidad_documentos]:
+            cloned = req.model_copy(deep=True)
+            cloned.query = force_query_for_class(req.query, n)
+            cloned.objetivo = force_goal_for_class(req.objetivo, n)
+            cloned.cantidad_documentos = 1
+            generated.append(cloned)
+
+        return generated
+
+    text = f"{req.query} {req.objetivo}".lower()
+
+    if any(term in text for term in ["dos clases", "2 clases", "ambas clases", "las dos clases"]):
+        class_nums = extract_explicit_class_numbers(text)
+        if not class_nums:
+            class_nums = [1, 2]
+
+        generated = []
+        for n in class_nums:
+            cloned = req.model_copy(deep=True)
+            cloned.query = force_query_for_class(req.query, n)
+            cloned.objetivo = force_goal_for_class(req.objetivo, n)
+            generated.append(cloned)
+        return generated
+
+    class_nums = extract_explicit_class_numbers(text)
+    if len(class_nums) > 1:
+        generated = []
+        for n in class_nums:
+            cloned = req.model_copy(deep=True)
+            cloned.query = force_query_for_class(req.query, n)
+            cloned.objetivo = force_goal_for_class(req.objetivo, n)
+            generated.append(cloned)
+        return generated
+
+    return [req]
+
+
+def force_query_for_class(original: str, class_number: int) -> str:
+    return f"{original}\n\nEste documento debe corresponder específicamente a la Clase {class_number}."
+
+
+def force_goal_for_class(original: str, class_number: int) -> str:
+    return f"{original}\n\nGenerar específicamente el documento correspondiente a la Clase {class_number}."
 
 
 def build_generation_prompt(req: ImproveRequest, context_body: str, has_context: bool) -> str:
@@ -285,6 +389,10 @@ Reglas de respuesta:
 - {fuentes_texto}
 - Si se usaron fuentes ISDM, cerrar con una sección breve llamada "Fuentes ISDM recuperadas:".
 - Si no se encontraron o no se usaron fuentes, aclararlo explícitamente al final.
+- Si el pedido corresponde a una clase, estructurar la salida como planificación docente profesional.
+- Si el pedido menciona duración u horas, respetarlas en la planificación.
+- No incluir explicaciones meta ni texto conversacional.
+- Escribir el contenido final listo para pasar a Word.
 
 Contexto recuperado:
 {context_body}
@@ -292,13 +400,6 @@ Contexto recuperado:
 
 
 def parse_text_to_docx(document, output_text: str):
-    """
-    Parser simple y robusto:
-    - líneas con # => heading
-    - líneas tipo '1. Título...' => heading
-    - resto => párrafos
-    - listas con -, •, * => bullets
-    """
     blocks = [b.strip() for b in output_text.split("\n\n") if b.strip()]
 
     for block in blocks:
@@ -308,7 +409,6 @@ def parse_text_to_docx(document, output_text: str):
 
         first = lines[0]
 
-        # Heading markdown
         if first.startswith("#"):
             level = min(first.count("#"), 3)
             heading_text = first.lstrip("#").strip() or "Sección"
@@ -320,7 +420,6 @@ def parse_text_to_docx(document, output_text: str):
                     document.add_paragraph(ln)
             continue
 
-        # Títulos numerados
         if re.match(r"^\d+[\.\)]\s+", first):
             document.add_heading(first, level=2)
             for ln in lines[1:]:
@@ -330,12 +429,10 @@ def parse_text_to_docx(document, output_text: str):
                     document.add_paragraph(ln)
             continue
 
-        # Línea única corta = título
         if len(lines) == 1 and len(first) <= 110 and not first.endswith("."):
             document.add_heading(first, level=2)
             continue
 
-        # bloque normal
         for ln in lines:
             if re.match(r"^[-•*]\s+", ln):
                 document.add_paragraph(re.sub(r"^[-•*]\s+", "", ln), style="List Bullet")
@@ -348,7 +445,7 @@ def save_output_document(output_text: str, req: ImproveRequest) -> Path:
     Mantiene la lógica usada en Taller:
     - carpeta base: OUTPUT_ROOT_DIR
     - subcarpeta por materia normalizada
-    - subcarpeta opcional detectada por contexto (ej. diagnóstico)
+    - subcarpeta opcional detectada por contexto
     - nombre base a partir del pedido
     - si existe, agrega sufijo _2, _3, etc.
     """
@@ -383,10 +480,13 @@ def save_output_document(output_text: str, req: ImproveRequest) -> Path:
         document = Document()
         parse_text_to_docx(document, output_text)
         document.save(candidate_docx)
+        logger.info("Archivo DOCX guardado en: %s", candidate_docx)
         return candidate_docx
 
-    except Exception:
+    except Exception as e:
+        logger.exception("Fallo guardado DOCX. Se intentará MD. Error: %s", e)
         candidate_md.write_text(output_text, encoding="utf-8")
+        logger.info("Archivo MD guardado en: %s", candidate_md)
         return candidate_md
 
 
@@ -421,13 +521,7 @@ def extract_text_from_search_item(item) -> str:
     return txt
 
 
-# -------------------------
-# SEARCH
-# -------------------------
-
-
-@app.post("/search", response_model=SearchResponse)
-def search(req: SearchRequest, _: str = Depends(require_api_key)):
+def build_filters(req: SearchRequest):
     filter_clauses = []
 
     if req.anio:
@@ -465,91 +559,68 @@ def search(req: SearchRequest, _: str = Depends(require_api_key)):
             "value": req.tipo
         })
 
-    filters = None
     if len(filter_clauses) == 1:
-        filters = filter_clauses[0]
-    elif len(filter_clauses) > 1:
-        filters = {
+        return filter_clauses[0]
+
+    if len(filter_clauses) > 1:
+        return {
             "type": "and",
             "filters": filter_clauses
         }
 
-    try:
-        resp = client.vector_stores.search(
-            vector_store_id=VECTOR_STORE_ID,
-            query=req.query,
-            max_num_results=req.k,
-            filters=filters
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Vector store search failed: {e}")
-
-    out = []
-    for item in resp.data:
-        txt = extract_text_from_search_item(item)
-        out.append(SearchResult(
-            text=txt,
-            score=float(getattr(item, "score", 0.0)),
-            file_id=str(getattr(item, "file_id", "")),
-            attributes=getattr(item, "attributes", None)
-        ))
-
-    return SearchResponse(vector_store_id=VECTOR_STORE_ID, results=out)
+    return None
 
 
-# -------------------------
-# IMPROVE FOR 2026
-# -------------------------
-
-
-@app.post("/improve_2026", response_model=ImproveResponse)
-def improve_2026(req: ImproveRequest, _: str = Depends(require_api_key)):
+def build_context_and_sources(req: ImproveRequest) -> tuple[list[dict], str]:
     sources: list[dict] = []
     context = ""
 
-    if req.modo_fuentes != "none":
-        sreq = SearchRequest(
-            query=req.query,
-            k=req.k,
-            anio=req.anio,
-            materia=req.materia,
-            unidad=req.unidad,
-            unidad_num=req.unidad_num,
-            tipo=req.tipo
+    if req.modo_fuentes == "none":
+        return sources, context
+
+    sreq = SearchRequest(
+        query=req.query,
+        k=req.k,
+        anio=req.anio,
+        materia=req.materia,
+        unidad=req.unidad,
+        unidad_num=req.unidad_num,
+        tipo=req.tipo
+    )
+
+    sresp: SearchResponse = search(sreq, API_KEY)
+
+    context_blocks = []
+    for i, r in enumerate(sresp.results, start=1):
+        meta = r.attributes or {}
+        sources.append({
+            "rank": i,
+            "score": r.score,
+            "source_name": meta.get("source_name"),
+            "source_path": meta.get("source_path"),
+            "anio": meta.get("anio"),
+            "materia": meta.get("materia"),
+            "unidad": meta.get("unidad"),
+            "unidad_num": meta.get("unidad_num"),
+            "tipo": meta.get("tipo"),
+            "file_id": r.file_id,
+        })
+        context_blocks.append(
+            f"[FUENTE {i}] "
+            f"{meta.get('source_name', '(sin nombre)')} | "
+            f"{meta.get('materia', '?')} {meta.get('anio', '?')} {meta.get('unidad', '')}\n"
+            f"{r.text}\n"
         )
 
-        sresp: SearchResponse = search(sreq, API_KEY)
+    context = "\n\n".join(context_blocks)
 
-        context_blocks = []
-        for i, r in enumerate(sresp.results, start=1):
-            meta = r.attributes or {}
-            sources.append({
-                "rank": i,
-                "score": r.score,
-                "source_name": meta.get("source_name"),
-                "source_path": meta.get("source_path"),
-                "anio": meta.get("anio"),
-                "materia": meta.get("materia"),
-                "unidad": meta.get("unidad"),
-                "unidad_num": meta.get("unidad_num"),
-                "tipo": meta.get("tipo"),
-                "file_id": r.file_id,
-            })
-            context_blocks.append(
-                f"[FUENTE {i}] "
-                f"{meta.get('source_name', '(sin nombre)')} | "
-                f"{meta.get('materia', '?')} {meta.get('anio', '?')} {meta.get('unidad', '')}\n"
-                f"{r.text}\n"
-            )
+    if req.modo_fuentes == "required" and not sresp.results:
+        return [], ""
 
-        context = "\n\n".join(context_blocks)
+    return sources, context
 
-        if req.modo_fuentes == "required" and len(sresp.results) == 0:
-            return ImproveResponse(
-                used_sources=[],
-                output="No encontré fuentes ISDM con esos filtros."
-            )
 
+def generate_single_output(req: ImproveRequest, context: str) -> str:
     has_context = bool(context.strip())
 
     if has_context:
@@ -571,26 +642,102 @@ def improve_2026(req: ImproveRequest, _: str = Depends(require_api_key)):
         has_context=has_context
     )
 
+    resp = client.responses.create(
+        model=MODEL_NAME,
+        input=[
+            {"role": "system", "content": rule},
+            {"role": "user", "content": prompt},
+        ],
+    )
+
+    return getattr(resp, "output_text", None) or str(resp)
+
+
+# -------------------------
+# SEARCH (PROTEGIDO)
+# -------------------------
+
+
+@app.post("/search", response_model=SearchResponse)
+def search(req: SearchRequest, _: str = Depends(require_api_key)):
+    filters = build_filters(req)
+
     try:
-        resp = client.responses.create(
-            model="gpt-4.1-mini",
-            input=[
-                {"role": "system", "content": rule},
-                {"role": "user", "content": prompt},
-            ],
+        resp = client.vector_stores.search(
+            vector_store_id=VECTOR_STORE_ID,
+            query=req.query,
+            max_num_results=req.k,
+            filters=filters
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OpenAI generation failed: {e}")
+        logger.exception("Vector store search failed")
+        raise HTTPException(status_code=500, detail=f"Vector store search failed: {e}")
 
-    output_text = getattr(resp, "output_text", None) or str(resp)
+    out = []
+    for item in resp.data:
+        txt = extract_text_from_search_item(item)
 
-    try:
-        saved_path = save_output_document(output_text=output_text, req=req)
-        output_text += f"\n\n[Archivo guardado en: {saved_path}]"
-    except Exception as e:
-        output_text += f"\n\n[No se pudo guardar archivo localmente: {e}]"
+        out.append(SearchResult(
+            text=txt,
+            score=float(getattr(item, "score", 0.0)),
+            file_id=str(getattr(item, "file_id", "")),
+            attributes=getattr(item, "attributes", None)
+        ))
+
+    return SearchResponse(vector_store_id=VECTOR_STORE_ID, results=out)
+
+
+# -------------------------
+# IMPROVE FOR 2026 (PROTEGIDO)
+# -------------------------
+
+
+@app.post("/improve_2026", response_model=ImproveResponse)
+def improve_2026(req: ImproveRequest, _: str = Depends(require_api_key)):
+    logger.info(
+        "Nueva solicitud improve_2026 | materia=%s | unidad=%s | tipo=%s",
+        req.materia, req.unidad, req.tipo
+    )
+
+    expanded_requests = infer_multi_class_requests(req)
+    logger.info("Documentos a generar: %s", len(expanded_requests))
+
+    # Contexto y fuentes se recuperan una vez con el request original
+    sources, context = build_context_and_sources(req)
+
+    if req.modo_fuentes == "required" and not context.strip():
+        return ImproveResponse(
+            used_sources=[],
+            output="No encontré fuentes ISDM con esos filtros."
+        )
+
+    outputs: list[str] = []
+    saved_paths: list[str] = []
+
+    for index, subreq in enumerate(expanded_requests, start=1):
+        try:
+            logger.info("Generando documento %s/%s", index, len(expanded_requests))
+            output_text = generate_single_output(subreq, context)
+
+            saved_path = save_output_document(output_text=output_text, req=subreq)
+            saved_paths.append(str(saved_path))
+
+            outputs.append(
+                f"=== DOCUMENTO {index} ===\n\n{output_text}\n\n[Archivo guardado en: {saved_path}]"
+            )
+
+        except Exception as e:
+            logger.exception("Error generando documento %s", index)
+            outputs.append(
+                f"=== DOCUMENTO {index} ===\n\nNo se pudo generar este documento.\nDetalle técnico: {e}"
+            )
+
+    final_output = "\n\n".join(outputs)
+
+    if saved_paths:
+        final_output += "\n\nArchivos guardados:\n" + "\n".join(f"- {p}" for p in saved_paths)
 
     return ImproveResponse(
         used_sources=sources,
-        output=output_text
+        output=final_output
     )
