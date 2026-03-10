@@ -12,7 +12,7 @@ from openai import OpenAI
 
 load_dotenv()
 
-app = FastAPI(title="ISDM RAG API", version="0.4.1")
+app = FastAPI(title="ISDM RAG API", version="0.5.0")
 
 # -------------------------
 # SEGURIDAD API KEY
@@ -49,7 +49,6 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 VECTOR_STORE_NAME = os.environ.get("VECTOR_STORE_NAME", "ISDM_2025_C1")
 
-# Ruta base pedida por vos
 OUTPUT_ROOT_DIR = Path(
     os.environ.get(
         "OUTPUT_ROOT_DIR",
@@ -70,13 +69,18 @@ def get_vector_store_id() -> str:
 VECTOR_STORE_ID = get_vector_store_id()
 
 # -------------------------
-# BASIC ENDPOINTS (PÚBLICOS)
+# BASIC ENDPOINTS
 # -------------------------
 
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ISDM_RAG", "version": app.version}
+    return {
+        "ok": True,
+        "service": "ISDM_RAG",
+        "version": app.version,
+        "output_root_dir": str(OUTPUT_ROOT_DIR),
+    }
 
 
 @app.get("/health")
@@ -117,7 +121,7 @@ class ImproveRequest(BaseModel):
     anio: Optional[str] = None
     materia: Optional[str] = None
     unidad: Optional[str] = None
-    k: int = Field(10, ge=3, le=20)
+    k: int = Field(10, ge=1, le=20)
     unidad_num: Optional[str] = None
     tipo: Optional[str] = None
 
@@ -142,7 +146,7 @@ class ImproveResponse(BaseModel):
 # -------------------------
 
 
-def sanitize_filename(value: Optional[str], fallback: str) -> str:
+def sanitize_filename(value: Optional[str], fallback: str = "Documento") -> str:
     text = (value or "").strip()
     if not text:
         text = fallback
@@ -198,16 +202,26 @@ def normalize_materia_folder(materia: Optional[str]) -> str:
 def detect_file_prefix(req: ImproveRequest) -> str:
     text = f"{req.query} {req.objetivo} {req.formato_salida} {req.tipo or ''}".lower()
 
-    if "primera clase" in text or "clase 1" in text or "clase uno" in text:
-        return "Clase_01"
-    if "segunda clase" in text or "clase 2" in text or "clase dos" in text:
-        return "Clase_02"
-    if "tercera clase" in text or "clase 3" in text or "clase tres" in text:
-        return "Clase_03"
-    if "cuarta clase" in text or "clase 4" in text:
-        return "Clase_04"
-    if "quinta clase" in text or "clase 5" in text:
-        return "Clase_05"
+    # clases por número
+    patterns = [
+        (r"\bprimera clase\b|\bclase 1\b|\bclase uno\b", "Clase_1"),
+        (r"\bsegunda clase\b|\bclase 2\b|\bclase dos\b", "Clase_2"),
+        (r"\btercera clase\b|\bclase 3\b|\bclase tres\b", "Clase_3"),
+        (r"\bcuarta clase\b|\bclase 4\b|\bclase cuatro\b", "Clase_4"),
+        (r"\bquinta clase\b|\bclase 5\b|\bclase cinco\b", "Clase_5"),
+        (r"\bsexta clase\b|\bclase 6\b|\bclase seis\b", "Clase_6"),
+        (r"\bséptima clase\b|\bseptima clase\b|\bclase 7\b", "Clase_7"),
+        (r"\boctava clase\b|\bclase 8\b", "Clase_8"),
+        (r"\bnovena clase\b|\bclase 9\b", "Clase_9"),
+        (r"\bdécima clase\b|\bdecima clase\b|\bclase 10\b", "Clase_10"),
+    ]
+
+    for pattern, prefix in patterns:
+        if re.search(pattern, text):
+            return prefix
+
+    if "diagnostico" in text or "diagnóstico" in text:
+        return "Diagnostico"
 
     if "cronograma" in text:
         return "Cronograma"
@@ -215,7 +229,26 @@ def detect_file_prefix(req: ImproveRequest) -> str:
     if "planificación" in text or "planificacion" in text:
         return "Planificacion"
 
+    if "clase" in text:
+        return "Clase"
+
     return "Documento"
+
+
+def detect_subfolder(req: ImproveRequest) -> Optional[str]:
+    """
+    Mantiene la lógica libre y flexible que ya venías usando:
+    si el pedido menciona diagnóstico, crea subcarpeta.
+    Si no, guarda directo en la carpeta de la materia.
+    """
+    text = f"{req.query} {req.objetivo} {req.unidad or ''} {req.tipo or ''}".lower()
+
+    if "diagnostico" in text or "diagnóstico" in text:
+        if req.materia and "taller" in req.materia.lower():
+            return "diagnostico_programacion"
+        return "diagnostico"
+
+    return None
 
 
 def build_generation_prompt(req: ImproveRequest, context_body: str, has_context: bool) -> str:
@@ -258,37 +291,86 @@ Contexto recuperado:
 """.strip()
 
 
+def parse_text_to_docx(document, output_text: str):
+    """
+    Parser simple y robusto:
+    - líneas con # => heading
+    - líneas tipo '1. Título...' => heading
+    - resto => párrafos
+    - listas con -, •, * => bullets
+    """
+    blocks = [b.strip() for b in output_text.split("\n\n") if b.strip()]
+
+    for block in blocks:
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if not lines:
+            continue
+
+        first = lines[0]
+
+        # Heading markdown
+        if first.startswith("#"):
+            level = min(first.count("#"), 3)
+            heading_text = first.lstrip("#").strip() or "Sección"
+            document.add_heading(heading_text, level=level)
+            for ln in lines[1:]:
+                if re.match(r"^[-•*]\s+", ln):
+                    document.add_paragraph(re.sub(r"^[-•*]\s+", "", ln), style="List Bullet")
+                else:
+                    document.add_paragraph(ln)
+            continue
+
+        # Títulos numerados
+        if re.match(r"^\d+[\.\)]\s+", first):
+            document.add_heading(first, level=2)
+            for ln in lines[1:]:
+                if re.match(r"^[-•*]\s+", ln):
+                    document.add_paragraph(re.sub(r"^[-•*]\s+", "", ln), style="List Bullet")
+                else:
+                    document.add_paragraph(ln)
+            continue
+
+        # Línea única corta = título
+        if len(lines) == 1 and len(first) <= 110 and not first.endswith("."):
+            document.add_heading(first, level=2)
+            continue
+
+        # bloque normal
+        for ln in lines:
+            if re.match(r"^[-•*]\s+", ln):
+                document.add_paragraph(re.sub(r"^[-•*]\s+", "", ln), style="List Bullet")
+            else:
+                document.add_paragraph(ln)
+
+
 def save_output_document(output_text: str, req: ImproveRequest) -> Path:
     """
-    Guarda la salida en:
-    C:\\xampp\\htdocs\\ProfePilar\\data\\ISDM\\2026\\ISDM\\<MateriaNormalizada>\\
-    Crea la carpeta de la materia una sola vez si no existe.
-    Luego guarda allí todos los documentos.
+    Mantiene la lógica usada en Taller:
+    - carpeta base: OUTPUT_ROOT_DIR
+    - subcarpeta por materia normalizada
+    - subcarpeta opcional detectada por contexto (ej. diagnóstico)
+    - nombre base a partir del pedido
+    - si existe, agrega sufijo _2, _3, etc.
     """
-
     materia_dir_name = normalize_materia_folder(req.materia)
     target_dir = OUTPUT_ROOT_DIR / materia_dir_name
+
+    subfolder = detect_subfolder(req)
+    if subfolder:
+        target_dir = target_dir / subfolder
+
     target_dir.mkdir(parents=True, exist_ok=True)
 
     prefix = detect_file_prefix(req)
 
-    unidad_part = sanitize_filename(req.unidad, "")
-    tipo_part = sanitize_filename(req.tipo, "")
-    formato_part = sanitize_filename(req.formato_salida, "")
-
-    extras = [x for x in [unidad_part, tipo_part, formato_part] if x]
-    base_filename = prefix
-    if extras:
-        base_filename += "_" + "_".join(extras)
-
-    candidate_docx = target_dir / f"{base_filename}.docx"
-    candidate_md = target_dir / f"{base_filename}.md"
+    candidate_docx = target_dir / f"{prefix}.docx"
+    candidate_md = target_dir / f"{prefix}.md"
 
     if candidate_docx.exists() or candidate_md.exists():
         suffix = 2
         while True:
-            alt_docx = target_dir / f"{base_filename}_{suffix}.docx"
-            alt_md = target_dir / f"{base_filename}_{suffix}.md"
+            alt_docx = target_dir / f"{prefix}_{suffix}.docx"
+            alt_md = target_dir / f"{prefix}_{suffix}.md"
             if not alt_docx.exists() and not alt_md.exists():
                 candidate_docx = alt_docx
                 candidate_md = alt_md
@@ -299,28 +381,7 @@ def save_output_document(output_text: str, req: ImproveRequest) -> Path:
         from docx import Document  # type: ignore
 
         document = Document()
-
-        for block in output_text.split("\n\n"):
-            clean_block = block.strip()
-            if not clean_block:
-                continue
-
-            lines = clean_block.splitlines()
-            first_line = lines[0].strip()
-
-            if len(lines) == 1 and len(first_line) <= 120:
-                document.add_heading(first_line, level=2)
-            elif first_line.startswith("#"):
-                heading_text = first_line.lstrip("#").strip()
-                document.add_heading(heading_text or "Sección", level=2)
-                for extra in lines[1:]:
-                    if extra.strip():
-                        document.add_paragraph(extra.strip())
-            else:
-                for line in lines:
-                    if line.strip():
-                        document.add_paragraph(line.strip())
-
+        parse_text_to_docx(document, output_text)
         document.save(candidate_docx)
         return candidate_docx
 
@@ -329,8 +390,39 @@ def save_output_document(output_text: str, req: ImproveRequest) -> Path:
         return candidate_md
 
 
+def extract_text_from_search_item(item) -> str:
+    txt = ""
+    content = getattr(item, "content", None)
+
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, dict):
+                if "text" in c and c["text"]:
+                    parts.append(str(c["text"]))
+                elif "content" in c and c["content"]:
+                    parts.append(str(c["content"]))
+            else:
+                c_text = getattr(c, "text", None)
+                if c_text:
+                    parts.append(str(c_text))
+                else:
+                    c_content = getattr(c, "content", None)
+                    if c_content:
+                        parts.append(str(c_content))
+        txt = "\n".join(parts).strip()
+
+    elif isinstance(content, dict):
+        txt = str(content.get("text") or content.get("content") or "").strip()
+
+    elif content is not None:
+        txt = str(content).strip()
+
+    return txt
+
+
 # -------------------------
-# SEARCH (PROTEGIDO)
+# SEARCH
 # -------------------------
 
 
@@ -394,34 +486,7 @@ def search(req: SearchRequest, _: str = Depends(require_api_key)):
 
     out = []
     for item in resp.data:
-        txt = ""
-
-        content = getattr(item, "content", None)
-
-        if isinstance(content, list):
-            parts = []
-            for c in content:
-                if isinstance(c, dict):
-                    if "text" in c and c["text"]:
-                        parts.append(str(c["text"]))
-                    elif "content" in c and c["content"]:
-                        parts.append(str(c["content"]))
-                else:
-                    c_text = getattr(c, "text", None)
-                    if c_text:
-                        parts.append(str(c_text))
-                    else:
-                        c_content = getattr(c, "content", None)
-                        if c_content:
-                            parts.append(str(c_content))
-            txt = "\n".join(parts).strip()
-
-        elif isinstance(content, dict):
-            txt = str(content.get("text") or content.get("content") or "").strip()
-
-        elif content is not None:
-            txt = str(content).strip()
-
+        txt = extract_text_from_search_item(item)
         out.append(SearchResult(
             text=txt,
             score=float(getattr(item, "score", 0.0)),
@@ -433,7 +498,7 @@ def search(req: SearchRequest, _: str = Depends(require_api_key)):
 
 
 # -------------------------
-# IMPROVE FOR 2026 (PROTEGIDO)
+# IMPROVE FOR 2026
 # -------------------------
 
 
@@ -452,6 +517,7 @@ def improve_2026(req: ImproveRequest, _: str = Depends(require_api_key)):
             unidad_num=req.unidad_num,
             tipo=req.tipo
         )
+
         sresp: SearchResponse = search(sreq, API_KEY)
 
         context_blocks = []
@@ -518,12 +584,11 @@ def improve_2026(req: ImproveRequest, _: str = Depends(require_api_key)):
 
     output_text = getattr(resp, "output_text", None) or str(resp)
 
-    # Guardado automático sin romper compatibilidad del response model
     try:
-        save_output_document(output_text=output_text, req=req)
-    except Exception:
-        # Si falla el guardado, no romper la respuesta del endpoint
-        pass
+        saved_path = save_output_document(output_text=output_text, req=req)
+        output_text += f"\n\n[Archivo guardado en: {saved_path}]"
+    except Exception as e:
+        output_text += f"\n\n[No se pudo guardar archivo localmente: {e}]"
 
     return ImproveResponse(
         used_sources=sources,
