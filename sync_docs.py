@@ -180,6 +180,7 @@ def main():
         if path.stat().st_size == 0:
             print("Skipping empty file:", path)
             continue
+        print("Found file:", path)
 
         if path.suffix.lower() not in SUPPORTED_EXTS:
             continue
