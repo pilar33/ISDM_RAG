@@ -1,7 +1,6 @@
 import os
 import re
 import logging
-from copy import deepcopy
 from pathlib import Path
 from typing import Optional
 
@@ -29,7 +28,7 @@ logger = logging.getLogger("isdm_rag_api")
 
 app = FastAPI(
     title="ISDM RAG API",
-    version="0.4.0",
+    version="0.5.0",
     servers=[{"url": "https://isdm-rag.onrender.com"}]
 )
 
@@ -117,8 +116,8 @@ def health():
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(..., min_length=2)
-    k: int = Field(8, ge=1, le=20)
+    query: str = Field(..., min_length=1)
+    k: int = Field(8, ge=1, le=50)
     anio: Optional[str] = None
     materia: Optional[str] = None
     unidad: Optional[str] = None
@@ -158,7 +157,6 @@ class ImproveRequest(BaseModel):
     tono: str = "profesional_cercano"
     restricciones: Optional[str] = None
 
-    # nuevos campos opcionales, no rompen compatibilidad
     cantidad_documentos: int = Field(1, ge=1, le=20)
     output_subdir: Optional[str] = None
 
@@ -166,6 +164,42 @@ class ImproveRequest(BaseModel):
 class ImproveResponse(BaseModel):
     used_sources: list[dict]
     output: str
+
+
+# -------------------------
+# MODELOS DEBUG
+# -------------------------
+
+
+class DebugListDocsRequest(BaseModel):
+    query: str = Field("documento", min_length=1)
+    k: int = Field(50, ge=1, le=100)
+    anio: Optional[str] = None
+    materia: Optional[str] = None
+    unidad: Optional[str] = None
+    unidad_num: Optional[str] = None
+    tipo: Optional[str] = None
+
+
+class DebugDocItem(BaseModel):
+    score: float
+    file_id: str
+    source_name: Optional[str] = None
+    source_path: Optional[str] = None
+    materia: Optional[str] = None
+    anio: Optional[str] = None
+    unidad: Optional[str] = None
+    unidad_num: Optional[str] = None
+    tipo: Optional[str] = None
+    normalized: Optional[bool] = None
+    source_ext: Optional[str] = None
+    subfolders: Optional[list] = None
+
+
+class DebugListDocsResponse(BaseModel):
+    vector_store_id: str
+    count: int
+    documents: list[DebugDocItem]
 
 
 # -------------------------
@@ -302,11 +336,6 @@ def extract_explicit_class_numbers(text: str) -> list[int]:
 
 
 def infer_multi_class_requests(req: ImproveRequest) -> list[ImproveRequest]:
-    """
-    Mantiene compatibilidad:
-    - si no detecta multi-documento => devuelve [req]
-    - si detecta varias clases => devuelve N requests derivados
-    """
     if req.cantidad_documentos > 1:
         generated = []
         class_nums = extract_explicit_class_numbers(f"{req.query} {req.objetivo}")
@@ -445,14 +474,6 @@ def parse_text_to_docx(document, output_text: str):
 
 
 def save_output_document(output_text: str, req: ImproveRequest) -> Path:
-    """
-    Mantiene la lógica usada en Taller:
-    - carpeta base: OUTPUT_ROOT_DIR
-    - subcarpeta por materia normalizada
-    - subcarpeta opcional detectada por contexto
-    - nombre base a partir del pedido
-    - si existe, agrega sufijo _2, _3, etc.
-    """
     materia_dir_name = normalize_materia_folder(req.materia)
     target_dir = OUTPUT_ROOT_DIR / materia_dir_name
 
@@ -575,6 +596,17 @@ def build_filters(req: SearchRequest):
     return None
 
 
+def run_vector_store_search(req: SearchRequest):
+    filters = build_filters(req)
+
+    return client.vector_stores.search(
+        vector_store_id=VECTOR_STORE_ID,
+        query=req.query,
+        max_num_results=req.k,
+        filters=filters
+    )
+
+
 def build_context_and_sources(req: ImproveRequest) -> tuple[list[dict], str]:
     sources: list[dict] = []
     context = ""
@@ -664,15 +696,8 @@ def generate_single_output(req: ImproveRequest, context: str) -> str:
 
 @app.post("/search", response_model=SearchResponse)
 def search(req: SearchRequest, _: str = Depends(require_api_key)):
-    filters = build_filters(req)
-
     try:
-        resp = client.vector_stores.search(
-            vector_store_id=VECTOR_STORE_ID,
-            query=req.query,
-            max_num_results=req.k,
-            filters=filters
-        )
+        resp = run_vector_store_search(req)
     except Exception as e:
         logger.exception("Vector store search failed")
         raise HTTPException(status_code=500, detail=f"Vector store search failed: {e}")
@@ -692,6 +717,61 @@ def search(req: SearchRequest, _: str = Depends(require_api_key)):
 
 
 # -------------------------
+# DEBUG LIST DOCS (PROTEGIDO)
+# -------------------------
+
+
+@app.post("/debug_list_docs", response_model=DebugListDocsResponse)
+def debug_list_docs(req: DebugListDocsRequest, _: str = Depends(require_api_key)):
+    """
+    Endpoint de diagnóstico:
+    devuelve la metadata real de los documentos que el Vector Store está recuperando
+    con esos filtros. Sirve para verificar qué quedó indexado de verdad.
+    """
+    sreq = SearchRequest(
+        query=req.query,
+        k=req.k,
+        anio=req.anio,
+        materia=req.materia,
+        unidad=req.unidad,
+        unidad_num=req.unidad_num,
+        tipo=req.tipo
+    )
+
+    try:
+        resp = run_vector_store_search(sreq)
+    except Exception as e:
+        logger.exception("debug_list_docs failed")
+        raise HTTPException(status_code=500, detail=f"debug_list_docs failed: {e}")
+
+    docs = []
+    for item in resp.data:
+        attrs = getattr(item, "attributes", None) or {}
+        docs.append(
+            DebugDocItem(
+                score=float(getattr(item, "score", 0.0)),
+                file_id=str(getattr(item, "file_id", "")),
+                source_name=attrs.get("source_name"),
+                source_path=attrs.get("source_path"),
+                materia=attrs.get("materia"),
+                anio=attrs.get("anio"),
+                unidad=attrs.get("unidad"),
+                unidad_num=attrs.get("unidad_num"),
+                tipo=attrs.get("tipo"),
+                normalized=attrs.get("normalized"),
+                source_ext=attrs.get("source_ext"),
+                subfolders=attrs.get("subfolders"),
+            )
+        )
+
+    return DebugListDocsResponse(
+        vector_store_id=VECTOR_STORE_ID,
+        count=len(docs),
+        documents=docs
+    )
+
+
+# -------------------------
 # IMPROVE FOR 2026 (PROTEGIDO)
 # -------------------------
 
@@ -706,7 +786,6 @@ def improve_2026(req: ImproveRequest, _: str = Depends(require_api_key)):
     expanded_requests = infer_multi_class_requests(req)
     logger.info("Documentos a generar: %s", len(expanded_requests))
 
-    # Contexto y fuentes se recuperan una vez con el request original
     sources, context = build_context_and_sources(req)
 
     if req.modo_fuentes == "required" and not context.strip():
