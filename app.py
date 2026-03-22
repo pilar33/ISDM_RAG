@@ -206,6 +206,62 @@ class DebugListDocsResponse(BaseModel):
 # HELPERS
 # -------------------------
 
+def normalize_materia_for_search(materia: Optional[str]) -> Optional[str]:
+    if not materia:
+        return None
+
+    raw = materia.strip().lower()
+
+    aliases = {
+        "pp2": "Practica Profesional II",
+        "practica profesional ii": "Practica Profesional II",
+        "práctica profesional ii": "Practica Profesional II",
+        "practica profesional 2": "Practica Profesional II",
+        "práctica profesional 2": "Practica Profesional II",
+
+        "taller": "Taller de Programacion",
+        "taller de programacion": "Taller de Programacion",
+        "taller de programación": "Taller de Programacion",
+    }
+
+    return aliases.get(raw, materia)
+
+
+def normalize_unidad(req: SearchRequest):
+    """
+    Convierte cosas como:
+    - Unidad 1
+    - Unidad I
+    - UnidadI
+    en unidad_num = "1"
+    """
+    if req.unidad_num:
+        return
+
+    if not req.unidad:
+        return
+
+    text = req.unidad.lower()
+
+    # número directo
+    match = re.search(r"\d+", text)
+    if match:
+        req.unidad_num = match.group()
+        return
+
+    # números romanos básicos
+    roman_map = {
+        "i": "1",
+        "ii": "2",
+        "iii": "3",
+        "iv": "4",
+        "v": "5",
+    }
+
+    for k, v in roman_map.items():
+        if k in text:
+            req.unidad_num = v
+            return
 
 def sanitize_filename(value: Optional[str], fallback: str) -> str:
     text = (value or "").strip()
@@ -597,6 +653,10 @@ def build_filters(req: SearchRequest):
 
 
 def run_vector_store_search(req: SearchRequest):
+    # 🔥 NORMALIZACIÓN AUTOMÁTICA
+    req.materia = normalize_materia_for_search(req.materia)
+    normalize_unidad(req)
+
     filters = build_filters(req)
 
     return client.vector_stores.search(
