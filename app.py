@@ -234,19 +234,24 @@ def normalize_unidad(req: SearchRequest):
     - Unidad I
     - UnidadI
     en unidad_num = "1"
+
+    Si logra inferir unidad_num, limpia req.unidad para no filtrar
+    simultáneamente por un texto que no coincide exactamente con la metadata indexada.
     """
     if req.unidad_num:
+        req.unidad = None
         return
 
     if not req.unidad:
         return
 
-    text = req.unidad.lower()
+    text = req.unidad.strip().lower()
 
     # número directo
     match = re.search(r"\d+", text)
     if match:
         req.unidad_num = match.group()
+        req.unidad = None
         return
 
     # números romanos básicos
@@ -258,9 +263,11 @@ def normalize_unidad(req: SearchRequest):
         "v": "5",
     }
 
-    for k, v in roman_map.items():
-        if k in text:
+    # buscamos la coincidencia más larga primero
+    for k, v in sorted(roman_map.items(), key=lambda x: len(x[0]), reverse=True):
+        if re.search(rf"\b{k}\b", text) or text.replace(" ", "") == f"unidad{k}":
             req.unidad_num = v
+            req.unidad = None
             return
 
 def sanitize_filename(value: Optional[str], fallback: str) -> str:
