@@ -24,6 +24,7 @@ ROMAN_MAP = {
     "X": "10",
 }
 
+
 def parse_unidad(folder_name: str) -> dict:
     """
     Devuelve:
@@ -33,33 +34,42 @@ def parse_unidad(folder_name: str) -> dict:
     """
     name = folder_name.strip()
 
+    if not name:
+        return {"unidad": None, "unidad_num": None, "tipo": "otros"}
+
     # Programa
     if name.lower() == "programa":
         return {"unidad": "Programa", "unidad_num": None, "tipo": "programa"}
 
-    # Normalizar "UnidadII" -> "Unidad II"
-    # y aceptar "Unidad I", "Unidad II", "Unidad1", "Unidad 1", "UnidadIV", etc.
-    m = re.match(r"^unidad\s*([ivx]+|\d+)$", name.lower().replace(" ", ""))
+    # Casos tipo: UnidadI, Unidad I, Unidad1, Unidad 1, UnidadIV
+    compact = name.lower().replace(" ", "")
+    m = re.match(r"^unidad([ivx]+|\d+)$", compact)
     if m:
         raw = m.group(1).upper()
         unidad_num = ROMAN_MAP.get(raw) if raw.isalpha() else raw
         return {"unidad": folder_name, "unidad_num": unidad_num, "tipo": "unidad"}
 
-    # Intento alternativo: "Unidad I" con espacio
-    m2 = re.match(r"^unidad\s*([IVX]+|\d+)$", name.strip(), flags=re.IGNORECASE)
+    # Intento alternativo
+    m2 = re.match(r"^unidad\s*([IVX]+|\d+)$", name, flags=re.IGNORECASE)
     if m2:
         raw = m2.group(1).upper()
         unidad_num = ROMAN_MAP.get(raw) if raw.isalpha() else raw
         return {"unidad": folder_name, "unidad_num": unidad_num, "tipo": "unidad"}
 
-    # Otros (evaluaciones, planificaciones, etc.)
     return {"unidad": folder_name, "unidad_num": None, "tipo": "otros"}
 
 
-# ----------------------------
-# METADATA DESDE RUTA
-# ----------------------------
 def extract_metadata_from_path(path: Path, docs_root: Path, normalized: bool):
+    """
+    Estructura asumida:
+        DOCS_ROOT = .../2025
+        rel.parts = [materia, unidad/programa/otros, subcarpetas..., archivo]
+
+    Ejemplos:
+        TallerDeProgramacion / Unidad I / clase1.docx
+        Practica Profesional II / Programa / programa.pdf
+        IntroduccionProgramacion / Materiales / apunte.docx
+    """
     rel = path.relative_to(docs_root)
     parts = list(rel.parts)
 
@@ -67,43 +77,34 @@ def extract_metadata_from_path(path: Path, docs_root: Path, normalized: bool):
         "source_path": str(path),
         "source_name": path.name,
         "source_ext": path.suffix.lower(),
-        "normalized": normalized
+        "normalized": normalized,
     }
 
-    def is_year(s: str) -> bool:
-        return s.isdigit() and len(s) == 4
+    # Año tomado desde DOCS_ROOT si termina en 2025, 2026, etc.
+    root_name = docs_root.name
+    if root_name.isdigit() and len(root_name) == 4:
+        metadata["anio"] = root_name
 
     if not parts:
         return metadata
 
-    # Estructura esperada: 2025 / TallerDeProgramacion / Unidad I / archivo
-    if is_year(parts[0]):
-        metadata["anio"] = parts[0]
-        if len(parts) >= 2:
-            metadata["materia"] = parts[1]
-        if len(parts) >= 3:
-            uinfo = parse_unidad(parts[2])
-            metadata.update(uinfo)
-        return metadata
+    # Primera carpeta debajo de DOCS_ROOT
+    # La guardamos como metadata disponible, pero no se usa para filtrar
+    if len(parts) >= 1:
+        metadata["materia"] = parts[0]
 
-    # Alternativa: TallerDeProgramacion / 2025 / Unidad I / archivo
-    metadata["materia"] = parts[0]
-    if len(parts) >= 2 and is_year(parts[1]):
-        metadata["anio"] = parts[1]
-        if len(parts) >= 3:
-            uinfo = parse_unidad(parts[2])
-            metadata.update(uinfo)
-    else:
-        if len(parts) >= 2:
-            uinfo = parse_unidad(parts[1])
-            metadata.update(uinfo)
+    # Segunda carpeta: programa / unidad / otros
+    if len(parts) >= 2:
+        uinfo = parse_unidad(parts[1])
+        metadata.update(uinfo)
+
+    # Subcarpetas intermedias, por si después sirven
+    if len(parts) > 3:
+        metadata["subfolders"] = list(parts[2:-1])
 
     return metadata
 
 
-# ----------------------------
-# VECTOR STORE
-# ----------------------------
 def get_or_create_vector_store(client: OpenAI, name: str) -> str:
     stores = client.vector_stores.list(limit=100)
     for s in stores.data:
@@ -113,9 +114,6 @@ def get_or_create_vector_store(client: OpenAI, name: str) -> str:
     return created.id
 
 
-# ----------------------------
-# UPLOADS
-# ----------------------------
 def upload_text_as_file(client: OpenAI, text: str):
     with NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as tmp:
         tmp.write(text)
@@ -142,19 +140,19 @@ def attach_file_to_vector_store(client: OpenAI, vector_store_id: str, file_id: s
     client.vector_stores.files.create(
         vector_store_id=vector_store_id,
         file_id=file_id,
-        attributes=attributes
+        attributes=attributes,
     )
 
 
-# ----------------------------
-# MAIN
-# ----------------------------
 def main():
     load_dotenv()
 
     api_key = os.environ["OPENAI_API_KEY"]
     docs_root = Path(os.environ["DOCS_ROOT"]).expanduser()
     vs_name = os.environ.get("VECTOR_STORE_NAME", "ISDM_DOCENCIA")
+
+    if not docs_root.exists():
+        raise FileNotFoundError(f"DOCS_ROOT no existe: {docs_root}")
 
     client = OpenAI(api_key=api_key)
 
@@ -169,26 +167,23 @@ def main():
         if path.suffix.lower() not in SUPPORTED_EXTS:
             continue
 
-        # Ignorar temporales/basura (si ya lo agregaste)
         name = path.name
+
+        # Ignorar temporales / basura
         if name.startswith("~$") or name.startswith("."):
             continue
         if name.lower() in {"thumbs.db", "desktop.ini"}:
             continue
 
-        # NUEVO: saltar archivos vacíos
+        # Saltar archivos vacíos
         if path.stat().st_size == 0:
             print("Skipping empty file:", path)
-            continue
-        print("Found file:", path)
-
-        if path.suffix.lower() not in SUPPORTED_EXTS:
             continue
 
         file_sha = sha256_of_file(path)
         rec = get_doc(str(path))
 
-        # Si no cambió, no reindexamos
+        # Si no cambió, no reindexar
         if rec and rec[1] == file_sha:
             continue
 
