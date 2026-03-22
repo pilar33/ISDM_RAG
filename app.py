@@ -27,7 +27,11 @@ logger = logging.getLogger("isdm_rag_api")
 # APP
 # -------------------------
 
-app = FastAPI(title="ISDM RAG API", version="0.6.0")
+app = FastAPI(
+    title="ISDM RAG API",
+    version="0.4.0",
+    servers=[{"url": "https://isdm-rag.onrender.com"}]
+)
 
 # -------------------------
 # SEGURIDAD API KEY
