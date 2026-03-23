@@ -28,7 +28,7 @@ logger = logging.getLogger("isdm_rag_api")
 
 app = FastAPI(
     title="ISDM RAG API",
-    version="0.5.0",
+    version="0.6.0",
     servers=[{"url": "https://isdm-rag.onrender.com"}]
 )
 
@@ -206,69 +206,6 @@ class DebugListDocsResponse(BaseModel):
 # HELPERS
 # -------------------------
 
-def normalize_materia_for_search(materia: Optional[str]) -> Optional[str]:
-    if not materia:
-        return None
-
-    raw = materia.strip().lower()
-
-    aliases = {
-        "pp2": "Practica Profesional II",
-        "practica profesional ii": "Practica Profesional II",
-        "práctica profesional ii": "Practica Profesional II",
-        "practica profesional 2": "Practica Profesional II",
-        "práctica profesional 2": "Practica Profesional II",
-
-        "taller": "Taller de Programacion",
-        "taller de programacion": "Taller de Programacion",
-        "taller de programación": "Taller de Programacion",
-    }
-
-    return aliases.get(raw, materia)
-
-
-def normalize_unidad(req: SearchRequest):
-    """
-    Convierte cosas como:
-    - Unidad 1
-    - Unidad I
-    - UnidadI
-    en unidad_num = "1"
-
-    Si logra inferir unidad_num, limpia req.unidad para no filtrar
-    simultáneamente por un texto que no coincide exactamente con la metadata indexada.
-    """
-    if req.unidad_num:
-        req.unidad = None
-        return
-
-    if not req.unidad:
-        return
-
-    text = req.unidad.strip().lower()
-
-    # número directo
-    match = re.search(r"\d+", text)
-    if match:
-        req.unidad_num = match.group()
-        req.unidad = None
-        return
-
-    # números romanos básicos
-    roman_map = {
-        "i": "1",
-        "ii": "2",
-        "iii": "3",
-        "iv": "4",
-        "v": "5",
-    }
-
-    # buscamos la coincidencia más larga primero
-    for k, v in sorted(roman_map.items(), key=lambda x: len(x[0]), reverse=True):
-        if re.search(rf"\b{k}\b", text) or text.replace(" ", "") == f"unidad{k}":
-            req.unidad_num = v
-            req.unidad = None
-            return
 
 def sanitize_filename(value: Optional[str], fallback: str) -> str:
     text = (value or "").strip()
@@ -298,26 +235,139 @@ def sanitize_filename(value: Optional[str], fallback: str) -> str:
     return text or fallback
 
 
-def normalize_materia_folder(materia: Optional[str]) -> str:
-    raw = (materia or "").strip().lower()
+def canon_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
 
-    aliases = {
-        "taller de programación": "TallerDeProgramacion",
-        "taller de programacion": "TallerDeProgramacion",
-        "taller_programacion": "TallerDeProgramacion",
-        "tallerdeprogramacion": "TallerDeProgramacion",
+    replacements = {
+        "á": "a", "à": "a", "ä": "a", "â": "a",
+        "é": "e", "è": "e", "ë": "e", "ê": "e",
+        "í": "i", "ì": "i", "ï": "i", "î": "i",
+        "ó": "o", "ò": "o", "ö": "o", "ô": "o",
+        "ú": "u", "ù": "u", "ü": "u", "û": "u",
+        "ñ": "n",
+        "Á": "a", "À": "a", "Ä": "a", "Â": "a",
+        "É": "e", "È": "e", "Ë": "e", "Ê": "e",
+        "Í": "i", "Ì": "i", "Ï": "i", "Î": "i",
+        "Ó": "o", "Ò": "o", "Ö": "o", "Ô": "o",
+        "Ú": "u", "Ù": "u", "Ü": "u", "Û": "u",
+        "Ñ": "n",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
 
-        "práctica profesional ii": "PracticaProfesionalII",
-        "practica profesional ii": "PracticaProfesionalII",
-        "práctica profesional 2": "PracticaProfesionalII",
-        "practica profesional 2": "PracticaProfesionalII",
-        "pp2": "PracticaProfesionalII",
-        "practicaprofesionalii": "PracticaProfesionalII",
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", "", text)
+    return text or None
+
+
+MATERIA_ALIASES = {
+    "tallerdeprogramacion": {
+        "TallerDeProgramacion",
+        "Taller de Programacion",
+        "Taller de Programación",
+        "Taller",
+    },
+    "practicaprofesionalii": {
+        "Practica Profesional II",
+        "Práctica Profesional II",
+        "PracticaProfesionalII",
+        "PP2",
+        "Practica Profesional 2",
+        "Práctica Profesional 2",
+    },
+    "introduccionprogramacion": {
+        "IntroduccionProgramacion",
+        "IntroducciónProgramacion",
+        "Introduccion a la Programacion",
+        "Introducción a la Programación",
+        "Introduccion Programacion",
+        "Introducción Programación",
+    },
+}
+
+
+def get_materia_aliases(materia: Optional[str]) -> list[str]:
+    if not materia:
+        return []
+
+    c = canon_text(materia)
+    if not c:
+        return []
+
+    for key, values in MATERIA_ALIASES.items():
+        if c == key or c in {canon_text(v) for v in values}:
+            # devolvemos una lista ordenada: primero la forma de carpeta si existe
+            preferred = []
+            if key == "tallerdeprogramacion":
+                preferred = ["TallerDeProgramacion", "Taller de Programacion", "Taller de Programación", "Taller"]
+            elif key == "practicaprofesionalii":
+                preferred = ["Practica Profesional II", "Práctica Profesional II", "PracticaProfesionalII", "PP2", "Practica Profesional 2", "Práctica Profesional 2"]
+            elif key == "introduccionprogramacion":
+                preferred = ["IntroduccionProgramacion", "IntroducciónProgramacion", "Introduccion a la Programacion", "Introducción a la Programación", "Introduccion Programacion", "Introducción Programación"]
+            return preferred
+
+    return [materia]
+
+
+def normalize_materia_for_search(materia: Optional[str]) -> Optional[str]:
+    aliases = get_materia_aliases(materia)
+    return aliases[0] if aliases else materia
+
+
+def normalize_unidad(req: SearchRequest):
+    """
+    Convierte:
+    - Unidad 1
+    - Unidad I
+    - UnidadI
+    en unidad_num = "1"
+    y limpia req.unidad para no filtrar por texto exacto.
+    """
+    if req.unidad_num:
+        req.unidad = None
+        return
+
+    if not req.unidad:
+        return
+
+    text = req.unidad.strip().lower()
+
+    match = re.search(r"\d+", text)
+    if match:
+        req.unidad_num = match.group()
+        req.unidad = None
+        return
+
+    roman_map = {
+        "i": "1",
+        "ii": "2",
+        "iii": "3",
+        "iv": "4",
+        "v": "5",
+        "vi": "6",
+        "vii": "7",
+        "viii": "8",
+        "ix": "9",
+        "x": "10",
     }
 
-    if raw in aliases:
-        return aliases[raw]
+    compact = re.sub(r"\s+", "", text)
+    for k, v in sorted(roman_map.items(), key=lambda x: len(x[0]), reverse=True):
+        if re.search(rf"\b{k}\b", text) or compact == f"unidad{k}":
+            req.unidad_num = v
+            req.unidad = None
+            return
 
+
+def normalize_materia_folder(materia: Optional[str]) -> str:
+    aliases = get_materia_aliases(materia)
+    if aliases:
+        raw = aliases[0]
+        return sanitize_filename(raw, "General").replace("_", "")
     cleaned = sanitize_filename(materia, "General")
     parts = [p for p in cleaned.split("_") if p]
     return "".join(p[:1].upper() + p[1:] for p in parts) or "General"
@@ -365,7 +415,7 @@ def detect_subfolder(req: ImproveRequest) -> Optional[str]:
     text = f"{req.query} {req.objetivo} {req.unidad or ''} {req.tipo or ''}".lower()
 
     if "diagnostico" in text or "diagnóstico" in text:
-        if req.materia and "taller" in req.materia.lower():
+        if req.materia and "taller" in canon_text(req.materia or ""):
             return "diagnostico_programacion"
         return "diagnostico"
 
@@ -659,19 +709,87 @@ def build_filters(req: SearchRequest):
     return None
 
 
+def apply_post_filter_by_materia(items, materia_aliases: list[str]):
+    if not materia_aliases:
+        return list(items)
+
+    allowed = {canon_text(x) for x in materia_aliases if canon_text(x)}
+    filtered = []
+
+    for item in items:
+        attrs = getattr(item, "attributes", None) or {}
+        item_materia = canon_text(attrs.get("materia"))
+        if item_materia in allowed:
+            filtered.append(item)
+
+    return filtered
+
+
 def run_vector_store_search(req: SearchRequest):
-    # 🔥 NORMALIZACIÓN AUTOMÁTICA
+    req = SearchRequest(**req.model_dump())
+
     req.materia = normalize_materia_for_search(req.materia)
     normalize_unidad(req)
 
-    filters = build_filters(req)
+    materia_aliases = get_materia_aliases(req.materia)
 
-    return client.vector_stores.search(
+    # intento 1: filtros normales
+    filters = build_filters(req)
+    resp = client.vector_stores.search(
         vector_store_id=VECTOR_STORE_ID,
         query=req.query,
         max_num_results=req.k,
         filters=filters
     )
+
+    if getattr(resp, "data", None):
+        return resp
+
+    # intento 2: si no hubo resultados y había materia,
+    # sacar filtro de materia y filtrar nosotros por aliases
+    if materia_aliases:
+        req2 = SearchRequest(**req.model_dump())
+        req2.materia = None
+        filters2 = build_filters(req2)
+
+        resp2 = client.vector_stores.search(
+            vector_store_id=VECTOR_STORE_ID,
+            query=req2.query,
+            max_num_results=max(req.k * 3, 20),
+            filters=filters2
+        )
+
+        filtered_items = apply_post_filter_by_materia(getattr(resp2, "data", []), materia_aliases)
+        if filtered_items:
+            resp2.data = filtered_items[:req.k]
+            return resp2
+
+    # intento 3: búsqueda más abierta sin unidad ni materia, solo query + anio/tipo si existen
+    req3 = SearchRequest(
+        query=req.query,
+        k=max(req.k * 3, 20),
+        anio=req.anio,
+        materia=None,
+        unidad=None,
+        unidad_num=None,
+        tipo=req.tipo
+    )
+    filters3 = build_filters(req3)
+
+    resp3 = client.vector_stores.search(
+        vector_store_id=VECTOR_STORE_ID,
+        query=req3.query,
+        max_num_results=req3.k,
+        filters=filters3
+    )
+
+    if materia_aliases:
+        filtered_items = apply_post_filter_by_materia(getattr(resp3, "data", []), materia_aliases)
+        if filtered_items:
+            resp3.data = filtered_items[:req.k]
+            return resp3
+
+    return resp
 
 
 def build_context_and_sources(req: ImproveRequest) -> tuple[list[dict], str]:
@@ -770,7 +888,7 @@ def search(req: SearchRequest, _: str = Depends(require_api_key)):
         raise HTTPException(status_code=500, detail=f"Vector store search failed: {e}")
 
     out = []
-    for item in resp.data:
+    for item in getattr(resp, "data", []):
         txt = extract_text_from_search_item(item)
 
         out.append(SearchResult(
@@ -790,11 +908,6 @@ def search(req: SearchRequest, _: str = Depends(require_api_key)):
 
 @app.post("/debug_list_docs", response_model=DebugListDocsResponse)
 def debug_list_docs(req: DebugListDocsRequest, _: str = Depends(require_api_key)):
-    """
-    Endpoint de diagnóstico:
-    devuelve la metadata real de los documentos que el Vector Store está recuperando
-    con esos filtros. Sirve para verificar qué quedó indexado de verdad.
-    """
     sreq = SearchRequest(
         query=req.query,
         k=req.k,
@@ -812,7 +925,7 @@ def debug_list_docs(req: DebugListDocsRequest, _: str = Depends(require_api_key)
         raise HTTPException(status_code=500, detail=f"debug_list_docs failed: {e}")
 
     docs = []
-    for item in resp.data:
+    for item in getattr(resp, "data", []):
         attrs = getattr(item, "attributes", None) or {}
         docs.append(
             DebugDocItem(
