@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends, Security
+from fastapi import Request,FastAPI, HTTPException, Depends, Security
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
 from openai import OpenAI
@@ -900,7 +900,14 @@ def search(req: SearchRequest, _: str = Depends(require_api_key)):
 
     return SearchResponse(vector_store_id=VECTOR_STORE_ID, results=out)
 
-
+@app.get("/debug_auth")
+def debug_auth(api_key: Optional[str] = Security(api_key_header)):
+    return {
+        "header_received": api_key is not None,
+        "header_value_preview": api_key[:4] + "..." if api_key else None,
+        "expected_preview": API_KEY[:4] + "..." if API_KEY else None,
+        "match": api_key == API_KEY if api_key and API_KEY else False,
+    }
 # -------------------------
 # DEBUG LIST DOCS (PROTEGIDO)
 # -------------------------
